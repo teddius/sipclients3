@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import hashlib
+import glob
 import os
 import re
 import signal
@@ -8,6 +10,8 @@ import urllib.request, urllib.parse, urllib.error
 import random
 import requests
 import uuid
+import pgpy
+import subprocess
 
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -15,10 +19,12 @@ from dateutil.tz import tzlocal
 from itertools import chain
 from lxml import html
 from optparse import OptionParser
+from pathlib import Path
 from threading import Event, Thread
 from time import sleep
 
 from application import log
+from application.system import makedirs
 from application.notification import IObserver, NotificationCenter
 from application.python.queue import EventQueue
 from application.python import Null
@@ -567,19 +573,35 @@ OTRTransport.register(MessageSession)
 @implementer(IObserver)
 class OutgoingCallInitializer(object):
 
-    def __init__(self, account, target, audio=False, chat=False, video=False):
+    def __init__(self, account, target, audio=False, chat=False, video=False, play_file=None):
         self.account = account
         self.target = target
         self.streams = []
+        self.play_file = play_file
+        self.playback_wave_player = None
+        self.play_file = play_file
+        application = SIPSessionApplication()
+        self.playback_dir = application.playback_dir
+        self.remote_identity = None
+
         if video:
             self.streams.append(MediaStreamRegistry.VideoStream())
         if audio:
-            self.streams.append(MediaStreamRegistry.AudioStream())
+            audio_stream = MediaStreamRegistry.AudioStream()
+            self.streams.append(audio_stream)
+            if self.play_file:
+                notification_center = NotificationCenter()
+                notification_center.add_observer(self, sender=audio_stream)
         if chat:
             self.streams.append(MediaStreamRegistry.ChatStream())
         self.wave_ringtone = None
 
     def start(self):
+        if self.play_file:
+            lock_file = "%s/playback.lock" % self.playback_dir
+            Path(lock_file).touch()
+            show_notice("Lock file %s created" % lock_file)
+
         if isinstance(self.account, BonjourAccount) and '@' not in self.target:
             show_notice('Bonjour mode requires a host in the destination address')
             return
@@ -641,6 +663,7 @@ class OutgoingCallInitializer(object):
         show_notice('Call to %s failed: DNS lookup error: %s' % (self.target, notification.data.error))
         notification_center = NotificationCenter()
         notification_center.remove_observer(self, sender=notification.sender)
+        self._remove_lock()
 
     def _NH_SIPSessionNewOutgoing(self, notification):
         session = notification.sender
@@ -648,6 +671,7 @@ class OutgoingCallInitializer(object):
         if session.local_identity.display_name:
             local_identity = '"%s" <%s>' % (session.local_identity.display_name, local_identity)
         remote_identity = str(session.remote_identity.uri)
+        self.remote_identity = remote_identity.split(":")[1]
         if session.remote_identity.display_name:
             remote_identity = '"%s" <%s>' % (session.remote_identity.display_name, remote_identity)
         show_notice("Initiating SIP session from %s to %s via %s..." % (local_identity, remote_identity, session.route))
@@ -657,7 +681,7 @@ class OutgoingCallInitializer(object):
         settings = SIPSimpleSettings()
         ui = UI()
         ringtone = settings.sounds.audio_outbound
-        if ringtone and self.wave_ringtone is None:
+        if ringtone and self.wave_ringtone is None and not self.play_file:
             self.wave_ringtone = WavePlayer(SIPApplication.voice_audio_mixer, ringtone.path.normalized, volume=ringtone.volume, loop_count=0, pause_time=2)
             SIPApplication.voice_audio_bridge.add(self.wave_ringtone)
             self.wave_ringtone.start()
@@ -671,6 +695,9 @@ class OutgoingCallInitializer(object):
             self.wave_ringtone = None
         ui.status = 'Connecting...'
 
+    def _NH_SIPSessionDidEnd(self, notification):
+        reactor.callLater(1, self._remove_lock)
+
     def _NH_SIPSessionDidStart(self, notification):
         notification_center = NotificationCenter()
         ui = UI()
@@ -678,9 +705,6 @@ class OutgoingCallInitializer(object):
         notification_center.remove_observer(self, sender=session)
         ui.status = 'Connected'
         reactor.callLater(2, setattr, ui, 'status', None)
-
-        application = SIPSessionApplication()
-        application.outgoing_session = None
 
         for stream in notification.data.streams:
             if stream.type in ('audio', 'video'):
@@ -697,15 +721,69 @@ class OutgoingCallInitializer(object):
                                                                                                   )
                 else:
                     show_notice('%s RTP endpoints %s:%d <-> %s:%d' % (stream.type.title(), stream.local_rtp_address, stream.local_rtp_port, stream.remote_rtp_address, stream.remote_rtp_port))
-
                 
         if session.remote_user_agent is not None:
             show_notice('Remote SIP User Agent is "%s"' % session.remote_user_agent)
 
+    def _NH_MediaStreamDidStart(self, notification):
+        stream = notification.sender
+        if stream.type == 'audio' and self.play_file:
+            script = "%s/scripts/%s-playback-start" % (self.playback_dir, self.remote_identity)
+            if os.path.exists(script):
+                show_notice("Running script %s" % script)
+                p = subprocess.Popen(script)
+            else:
+                show_notice("Script does not exist %s" % script)
+
+            file = ResourcePath(self.play_file).normalized
+            show_notice("Playback file %s\n" % file)
+            self.playback_wave_player = WavePlayer(SIPApplication.voice_audio_mixer, file)
+            notification_center = NotificationCenter()
+            notification_center.add_observer(self, sender=self.playback_wave_player)
+            stream.bridge.add(self.playback_wave_player)
+            #SIPApplication.voice_audio_bridge.add(self.playback_wave_player)
+            self.playback_wave_player.start()
+
+    def _NH_WavePlayerDidEnd(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        show_notice("Playback finished")
+        if self.play_file:
+            self._playback_end()
+            self.play_file = None
+            settings = SIPSimpleSettings()
+            api.sleep(0.3)
+            rogertone = settings.sounds.roger_beep
+            roger_tone = WavePlayer(SIPApplication.voice_audio_mixer, rogertone.path.normalized)
+            show_notice("Play roger beep")
+            SIPApplication.voice_audio_bridge.add(roger_tone)
+            roger_tone.start()
+
+        if notification.sender == self.playback_wave_player:
+            application = SIPSessionApplication()
+            if application.outgoing_session:
+                application.outgoing_session.end()
+
+    def _NH_WavePlayerDidFail(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        show_notice('Playback %s failed: %s' % (notification.sender.filename, notification.data.error))
+        if notification.sender == self.playback_wave_player or self.play_file:
+            self._playback_end()
+            self.play_file = None
+            application = SIPSessionApplication()
+            if application.outgoing_session:
+                application.outgoing_session.end()
+                                    
     def _NH_SIPSessionDidFail(self, notification):
+        self._remove_lock()
+
         notification_center = NotificationCenter()
         session = notification.sender
         notification_center.remove_observer(self, sender=session)
+        self.play_file = None
+        if self.playback_wave_player:
+            SIPApplication.voice_audio_bridge.remove(self.playback_wave_player)
 
         ui = UI()
         ui.status = None
@@ -724,6 +802,22 @@ class OutgoingCallInitializer(object):
         else:
             pass
             #show_notice('SIP session failed: %s' % notification.data.failure_reason)
+
+    def _playback_end(self):
+        script = "%s/scripts/%s-playback-end" % (self.playback_dir, self.remote_identity)
+
+        if os.path.exists(script):
+            show_notice("Running script %s" % script)
+            p = subprocess.Popen(script)
+        
+        save_path = self.playback_dir + '/history/' + os.path.basename(self.play_file)
+        show_notice("Saved playback file to %s" % save_path)
+        os.rename(self.play_file, save_path)
+        
+    def _remove_lock(self):
+        lock_file = "%s/playback.lock" % self.playback_dir
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
 
 
 @implementer(IObserver)
@@ -783,13 +877,20 @@ class IncomingCallInitializer(object):
     def _NH_UIQuestionGotAnswer(self, notification):
         notification_center = NotificationCenter()
         ui = UI()
+        application = SIPSessionApplication()
         notification_center.remove_observer(self, sender=notification.sender)
         answer = notification.data.answer
         self.question = None
         if answer == 'a':
+            if application.received_private_key:
+                show_notice('Please enter password to decrypt the key:')
+                return
             self.session.accept(self.session.proposed_streams)
             ui.status = 'Accepting...'
         elif answer == 'r':
+            if application.received_private_key:
+                application.received_private_key = None
+                return
             self.session.reject()
             ui.status = 'Rejected'
             reactor.callLater(3, setattr, ui, 'status', None)
@@ -855,7 +956,7 @@ class IncomingCallInitializer(object):
                                                                                stream.remote_rtp_port))
 
                 if stream.encryption.active:
-                    show_notice('%s RTP stream is encrypted using %s (%s)\n' % (stream.type.title(), stream.encryption.type, stream.encryption.cipher.decode()))
+                    show_notice('%s RTP stream is encrypted using %s (%s)\n' % (stream.type.title(), stream.encryption.type, stream.encryption.cipher))
         if session.remote_user_agent is not None:
             show_notice('Remote SIP User Agent is "%s"' % session.remote_user_agent)
 
@@ -1391,7 +1492,6 @@ class IncomingTransferHandler(object):
         self._terminate(failure_reason=notification.data.reason)
 
 
-
 class SIPSessionApplication(SIPApplication):
     # public methods
     #
@@ -1415,6 +1515,9 @@ class SIPSessionApplication(SIPApplication):
         self.received_message_ids = set()
         
         self.message_sessions = set()
+        self.received_private_key = None
+        self.private_keys = {}
+        self.public_keys = {}
 
         self.ip_address_monitor = IPAddressMonitor()
         self.logger = None
@@ -1432,6 +1535,7 @@ class SIPSessionApplication(SIPApplication):
         self.smp_secret = None
         self.must_exit = False
         self.last_failure_reason = None
+        self.enable_playback = False
 
     def start(self, target, options, filepath=None):
         notification_center = NotificationCenter()
@@ -1439,6 +1543,32 @@ class SIPSessionApplication(SIPApplication):
         ui = UI()
 
         history_file = os.path.join(config_directory, 'input.history')
+        self.keys_path = os.path.join(config_directory, 'keys')
+        makedirs(self.keys_path)
+        
+        self.enable_playback = options.enable_playback
+        if options.playback_dir:
+            self.playback_dir = options.playback_dir
+        else:
+            self.playback_dir = "%s/spool/playback" % config_directory
+            makedirs(self.playback_dir)
+
+        if self.enable_playback:
+            lock_file = "%s/playback.lock" % self.playback_dir
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+
+            self.playback_queue = EventQueue(self._handle_outgoing_playback)
+
+            active_playback_dir = self.playback_dir + '/active'
+            makedirs(active_playback_dir)
+
+            history_playback_dir = self.playback_dir + '/history'
+            makedirs(history_playback_dir)
+
+            scripts_playback_dir = self.playback_dir + '/scripts'
+            makedirs(scripts_playback_dir)
+
         ui.input.add_history(history_file)
 
         self.options = options
@@ -1505,6 +1635,7 @@ class SIPSessionApplication(SIPApplication):
                           'B': 'dtmf B',
                           'C': 'dtmf C',
                           'D': 'dtmf D'}
+
         ui.start(control_bindings=control_bindings, display_text=False)
 
         Account.register_extension(AccountExtension)
@@ -1611,6 +1742,11 @@ class SIPSessionApplication(SIPApplication):
 
         self.ip_address_monitor.start()
 
+        if self.enable_playback:
+            show_notice("Polling %s for wav files" % self.playback_dir)
+            self.playback_queue.start()
+            reactor.callLater(3, self.poll_playback_directory)
+
         # set the file transfer directory if it's not set
         if settings.file_transfer.directory is None:
             settings.file_transfer.directory = 'file_transfers'
@@ -1636,6 +1772,31 @@ class SIPSessionApplication(SIPApplication):
                 call_initializer = OutgoingCallInitializer(self.account, self.target, audio=True, chat=True, video=True)
                 call_initializer.start()
 
+    def poll_playback_directory(self):
+        if self.outgoing_session:
+            reactor.callLater(0.1, self.poll_playback_directory)
+            return
+
+        files = list(filter(os.path.isfile, glob.glob(self.playback_dir + "/*.wav")))
+        files.sort(key=lambda x: os.path.getmtime(x))
+        for file in files:
+            if len(file.split('@')) == 2:
+                active_playback_dir = self.playback_dir + '/active'
+                basename = os.path.basename(file)
+                show_notice("Audio recording detected %s" % basename)
+                filename = '%s/%s-%s' % (active_playback_dir, datetime.now().strftime("%Y%m%d-%H%M%S"), basename)
+                os.replace(file, filename)
+                play_object = {'target': os.path.splitext(basename)[0], 
+                               'filename': filename}
+                self.playback_queue.put(play_object)
+
+        reactor.callLater(0.1, self.poll_playback_directory)
+        
+    def _handle_outgoing_playback(self, play_object):
+        self.play_file = play_object['filename']
+        call_initializer = OutgoingCallInitializer(self.account, play_object['target'], audio=True, play_file=self.play_file)
+        call_initializer.start()
+                
     def _NH_SIPApplicationWillEnd(self, notification):
         show_notice('Application will end')
         self.ip_address_monitor.stop()
@@ -1695,12 +1856,66 @@ class SIPSessionApplication(SIPApplication):
         else:
             show_notice('%s stream is relayed by server' % stream.type)
 
+    def handle_private_keys(self, password, key):
+        account = key['account']
+        private_key_encrypted = key['private_key']
+        public_key = key['public_key']
 
+        try:
+            pgpMessage = pgpy.PGPMessage.from_blob(private_key_encrypted.encode())
+            decryptedKeyPair = pgpMessage.decrypt(password)
+            private_key = decryptedKeyPair.message
+
+            private_key_path = "%s/%s.privkey" % (self.keys_path, account.id)
+            fd = open(private_key_path, "wb+")
+            fd.write(private_key.encode())
+            fd.close()
+
+            show_notice("Private key saved to %s" % private_key_path)
+
+            public_key_path = "%s/%s.pubkey" % (self.keys_path, account.id)
+            fd = open(public_key_path, "wb+")
+            fd.write(public_key.encode())
+            fd.close()
+
+            show_notice("Public key saved to %s" % public_key_path)
+
+            account.sms.private_key = private_key_path
+            account.sms.public_key = public_key_path
+            account.sms.public_key_checksum = hashlib.sha1(public_key.encode()).hexdigest()
+            account.save()
+
+        except Exception as e:
+            show_notice("Import private key failed: %s" % str(e))
+            
+    def get_public_key(self, uri):
+        public_key = None
+        try:
+            public_key = self.public_keys[uri]
+        except KeyError:
+            public_key_path = "%s/%s.pubkey" % (self.keys_path, uri)
+         
+            if os.path.exists(public_key_path):
+                try:
+                    public_key, _ = pgpy.PGPKey.from_file(public_key_path)
+                except Exception as e:
+                    pass
+                else:
+                    self.public_keys[uri] = public_key
+                    show_notice('PGP public key imported from %s' % public_key_path)
+        
+        return public_key
+            
     def _NH_UIInputGotText(self, notification):
         msrp_chat = None
         message_text = notification.data.text
         local_identity = '%s@%s' % (self.account.id.username, self.account.id.domain)
         encrypted = False
+
+        if self.received_private_key:
+            self.handle_private_keys(message_text, self.received_private_key)
+            self.received_private_key = None
+            return
 
         if self.active_session is not None:
             msrp_chat = next((stream for stream in self.active_session.streams if stream.type == 'chat'), None)
@@ -1827,7 +2042,7 @@ class SIPSessionApplication(SIPApplication):
             return
 
         self.last_failure_reason = notification.data.reason
-        show_notice('%s Failed to register Bonjour contact: %s' % (datetime.now().replace(microsecond=0), notification.data.reason))
+        #show_notice('%s Failed to register Bonjour contact: %s' % (datetime.now().replace(microsecond=0), notification.data.reason))
 
     def _NH_BonjourAccountRegistrationDidEnd(self, notification):
         pass
@@ -1868,6 +2083,10 @@ class SIPSessionApplication(SIPApplication):
         data = notification.data
 
         call_id = data.headers.get('Call-ID', Null).body
+        try:
+            instance_id = data.from_header.uri.parameters.get('instance_id', None).split(":")[2]
+        except (IndexError, AttributeError):
+            instance_id = None
 
         try:
             self.received_message_ids.remove(call_id)
@@ -1879,29 +2098,54 @@ class SIPSessionApplication(SIPApplication):
 
         content_type = data.content_type
 
-        if content_type not in ('text/plain', 'text/html', 'message/cpim', IsComposingDocument.content_type):
+        if content_type not in ('text/plain', 'text/html', 'message/cpim', IsComposingDocument.content_type, 'text/pgp-private-key', 'text/pgp-public-key'):
             return
 
-        account = AccountManager().find_account(data.request_uri)
-        is_composing = False
+        account = AccountManager().find_account(data.to_header.uri)
+        
+        if not account:
+            return
 
+        is_composing = False
+        private_key = None
+
+        try:
+            private_key = self.private_keys[account.id]
+        except KeyError:
+            try:
+                private_key, _ = pgpy.PGPKey.from_file(account.sms.private_key)
+            except Exception as e:
+                pass
+            else:
+                show_notice('PGP private key imported from %s' % account.sms.private_key)
+                self.private_keys[account.id] = private_key
+                
         from_header = FromHeader.new(data.from_header)
 
         identity = '%s@%s' % (from_header.uri.user.decode(), from_header.uri.host.decode())
+        remote_uri = identity
         if isinstance(account, BonjourAccount):
             via = data.headers.get('Via', Null)[0]
             route = Route(address=via.host, port=via.port, transport=via.transport.lower())
         else:
             route = None
 
-        message_session = self.message_session(identity, account=account, route=route)
+        if content_type not in ('text/pgp-private-key', 'text/pgp-public-key'):
+            message_session = self.message_session(identity, account=account, route=route)
+            parsed_payload = message_session.handle_incoming_message(data.from_header, content_type, data.body, call_id)
 
-        parsed_payload = message_session.handle_incoming_message(data.from_header, content_type, data.body, call_id)
+            if parsed_payload is None:
+                return
 
-        if parsed_payload is None:
-            return
-            
-        (content_type, content, identity, msg_id, encrypted) = parsed_payload            
+            (content_type, content, identity, msg_id, encrypted) = parsed_payload            
+        else:
+            content = data.body
+            encrypted = False
+            message_session = None
+
+        if content_type not in ('text/pgp-private-key', 'text/pgp-public-key', IsComposingDocument.content_type):
+            self.message_session_to = identity
+        
         if content_type == IsComposingDocument.content_type:
             # body must not be utf-8 decoded
             msg = IsComposingMessage.parse(content)
@@ -1924,14 +2168,13 @@ class SIPSessionApplication(SIPApplication):
 
             is_composing = True
 
-        if content_type != IsComposingDocument.content_type:
-            self.message_session_to = identity
 
         if from_header.display_name:
             identity = '"%s" <%s>' % (from_header.display_name, identity)
             
         content = content.decode() if isinstance(content, bytes) else content
-        
+        content = content.strip()
+
         if is_composing:
             ui = UI()
             ui.status = "%s is composing a message" % identity
@@ -1940,13 +2183,65 @@ class SIPSessionApplication(SIPApplication):
             if encrypted:
                 show_notice("%s %s wrote: %s (%s encrypted)" % (datetime.now().replace(microsecond=0), identity, content, msg_id))
             else:
-                show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, content, msg_id))
+                if content_type == 'text/pgp-public-key':
+                    if content.startswith('-----BEGIN PGP PUBLIC KEY BLOCK-----') and content.endswith('-----END PGP PUBLIC KEY BLOCK-----'):
+                        public_key_path = "%s/%s.pubkey" % (self.keys_path, instance_id or remote_uri)
+                        fd = open(public_key_path, "wb+")
+                        fd.write(content.encode())
+                        fd.close()
+                        self.get_public_key(instance_id or remote_uri)
+                        show_notice("Public key saved to %s" % public_key_path)
+                        return
+            
+                if content_type == 'text/pgp-private-key':
+                    public_key = ''
+                    private_key_encrypted = ''
 
-            if not encrypted and message_session.encryption.active and content_type != IsComposingDocument.content_type:
+                    start_public = False
+                    start_private = False
+
+                    for l in content.split("\n"):
+                        if l == "-----BEGIN PGP PUBLIC KEY BLOCK-----":
+                            start_public = True
+
+                        if l == "-----BEGIN PGP MESSAGE-----":
+                            start_public = False
+                            start_private = True
+
+                        if start_public:
+                            public_key = public_key + l + "\n"
+
+                        if start_private:
+                            private_key_encrypted = private_key_encrypted + l + "\n"
+                            
+                    if private_key_encrypted and public_key:
+                        self.received_private_key = {'account': account, 'private_key': private_key_encrypted, 'public_key': public_key}
+                        self.question = Question("Private key received for account %s, do you want to import it? (a)ccept/(r)eject" % (account.id), 'ar', bold=True)
+                        notification_center = NotificationCenter()
+                        notification_center.add_observer(self, sender=self.question)
+                        ui = UI()
+                        ui.add_question(self.question)
+                else:
+                    if content.startswith('-----BEGIN PGP MESSAGE-----') and content.endswith('-----END PGP MESSAGE-----') and not private_key:
+                        show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, 'Received a PGP message for which we have no private key', msg_id))
+                    else:
+                        try:
+                            pgpMessage = pgpy.PGPMessage.from_blob(content.encode())
+                            decrypted_message = private_key.decrypt(pgpMessage)
+                        except (pgpy.errors.PGPDecryptionError, pgpy.errors.PGPError) as e:
+                            show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, 'PGP decrypt error', msg_id))
+                            return
+                        except ValueError as e:
+                            show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, content, msg_id))
+                        else:
+                            content = bytes(decrypted_message.message, 'latin1').decode()
+                            show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, content, msg_id))
+
+            if not encrypted and message_session and message_session.encryption.active and content_type != IsComposingDocument.content_type:
                 show_notice("%s %s stopped the encryption" % (datetime.now().replace(microsecond=0), identity))
                 message_session.encryption.stop()
 
-            if content.startswith('?OTR:'):
+            if content.startswith('?OTR:') and message_session:
                 show_notice("%s %s encrypted message could not be read" % (datetime.now().replace(microsecond=0), identity))
                 message_session.encryption.stop()
 
@@ -2026,11 +2321,6 @@ class SIPSessionApplication(SIPApplication):
             if timer.active():
                 timer.cancel()
             del self.hangup_timers[id(session)]
-
-        hangup_tone = WavePlayer(self.voice_audio_mixer, ResourcePath('sounds/hangup_tone.wav').normalized)
-        notification_center.add_observer(self, sender=hangup_tone)
-        self.voice_audio_bridge.add(hangup_tone)
-        hangup_tone.start()
 
     def _NH_SIPSessionDidEnd(self, notification):
         notification_center = NotificationCenter()
@@ -2184,7 +2474,7 @@ class SIPSessionApplication(SIPApplication):
 
     def _NH_RTPStreamDidEnableEncryption(self, notification):
         stream = notification.sender
-        show_notice("%s encryption activated using %s (%s)" % (stream.type.title(), stream.encryption.type, stream.encryption.cipher.decode()))
+        show_notice("%s encryption activated using %s (%s)" % (stream.type.title(), stream.encryption.type, stream.encryption.cipher))
 
         if stream.encryption.type == 'ZRTP' and stream.type == 'audio':
             peer_name = stream.encryption.zrtp.peer_name if stream.encryption.zrtp.peer_name else None
@@ -2201,7 +2491,7 @@ class SIPSessionApplication(SIPApplication):
         show_notice('Audio stream using %s codec at %sHz' % (stream.codec.capitalize(), stream.sample_rate))
         show_notice('Audio RTP endpoints %s:%d <-> %s:%d' % (stream.local_rtp_address, stream.local_rtp_port, stream.remote_rtp_address, stream.remote_rtp_port))
         if stream.encryption.active:
-            show_notice('RTP audio stream is encrypted using %s (%s)\n' % (stream.encryption.type, stream.encryption.cipher.decode()))
+            show_notice('RTP audio stream is encrypted using %s (%s)\n' % (stream.encryption.type, stream.encryption.cipher))
 
     def _NH_AudioStreamDidStartRecordingAudio(self, notification):
         show_notice('Recording audio to %s' % notification.data.filename)
@@ -2333,7 +2623,6 @@ class SIPSessionApplication(SIPApplication):
             show_notice('Output device has been switched to: %s' % self.voice_audio_mixer.real_output_device)
         if changed_alert_device:
             show_notice('Alert device has been switched to: %s' % self.alert_audio_mixer.real_output_device)
-        
 
     def _NH_WavePlayerDidEnd(self, notification):
         notification_center = NotificationCenter()
@@ -3234,7 +3523,7 @@ class SIPSessionApplication(SIPApplication):
         lines.append('  /trace [[+|-]sip] [[+|-]msrp] [[+|-]pjsip] [[+|-]notifications]: toggle/set tracing on the console (ctrl-x s | ctrl-x m | ctrl-x j | ctrl-x n)')
         lines.append('  /rtp [on|off]: toggle/set printing RTP statistics and ICE negotiation results on the console (ctrl-x p)')
         lines.append('  /mute [on|off]: mute the microphone (ctrl-x u)')
-        lines.append('  /camera [device]: change audio input device (ctrl-x c)')
+        lines.append('  /camera [device]: change camera device (ctrl-x c)')
         lines.append('  /input [device]: change audio input device (ctrl-x i)')
         lines.append('  /output [device]: change audio output device (ctrl-x o)')
         lines.append('  /alert [device]: change audio alert device (ctrl-x a)')
@@ -3319,7 +3608,9 @@ if __name__ == '__main__':
     parser.print_usage = parser.print_help
     parser.add_option('-a', '--account', type='string', dest='account', help='The account name to use for any outgoing traffic. If not supplied, the default account will be used.', metavar='NAME')
     parser.add_option('-c', '--config-directory', type='string', dest='config_directory', help='The configuration directory to use. This overrides the default location.')
+    parser.add_option('--playback-dir', type='string', dest='playback_dir', help='Directory with wav files to be played after calling. The destination SIP address is taken from the filename. After playback the call is hangup')
     parser.add_option('-s', '--trace-sip', action='store_true', dest='trace_sip', default=False, help='Dump the raw contents of incoming and outgoing SIP messages.')
+    parser.add_option('-p', '--enable_playback', action='store_true', dest='enable_playback', default=False, help='Enable polling playback directory for new wavs.')
     parser.add_option('-m', '--trace-msrp', action='store_true', dest='trace_msrp', default=False, help='Dump msrp logging information and the raw contents of incoming and outgoing MSRP messages.')
     parser.add_option('-j', '--trace-pjsip', action='store_true', dest='trace_pjsip', default=False, help='Print PJSIP logging output.')
     parser.add_option('-n', '--trace-notifications', action='store_true', dest='trace_notifications', default=False, help='Print all notifications (disabled by default).')
